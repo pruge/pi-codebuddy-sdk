@@ -55,6 +55,9 @@ export const FALLBACK_MODELS: PiModel[] = [
 	{ id: "hy3-preview-agent-ioa", name: "Hunyuan 3 Preview", reasoning: true, input: ["text"], contextWindow: DEFAULT_CONTEXT, maxTokens: DEFAULT_MAX_TOKENS, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
 ];
 
+import type { ServedWindows } from "./served-context.js";
+import { applyServedWindows } from "./served-context.js";
+
 export type ModelOverrides = {
 	contextWindow?: number;
 	maxTokens?: number;
@@ -66,12 +69,15 @@ export type ModelOverrides = {
  * Apply config-driven overrides on top of the estimated model metadata.
  * `globalOverrides` applies to every model; `perModel` is keyed by model id
  * (matched by exact id first, then case-insensitive substring, longest key
- * wins) and beats the global defaults.
+ * wins) and beats the global defaults. `served` carries windows learned from the
+ * CLI's own `modelUsage`, which outrank the name-based estimate but lose to
+ * both override layers.
  */
 export function buildModels(
 	models: PiModel[],
 	globalOverrides?: ModelOverrides,
 	perModel?: Record<string, ModelOverrides>,
+	served?: ServedWindows,
 ): PiModel[] {
 	const sortedKeys = Object.keys(perModel ?? {}).sort((a, b) => b.length - a.length);
 	const match = (id: string): ModelOverrides | undefined => {
@@ -82,7 +88,10 @@ export function buildModels(
 		}
 		return undefined;
 	};
-	return models.map((m) => {
+	// Learned windows sit below the override layers: an explicit config value is
+	// the user overriding us on purpose, and must win over what the CLI reported.
+	const base = served ? applyServedWindows(models, served) : models;
+	return base.map((m) => {
 		const o = { ...globalOverrides, ...match(m.id) };
 		const contextWindow = o.contextWindow ?? m.contextWindow;
 		const maxTokens = o.maxTokens ?? m.maxTokens;

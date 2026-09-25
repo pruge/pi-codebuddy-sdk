@@ -23,6 +23,7 @@ import { withSdkGate } from "./sdk-gate.js";
 import { closeQueryTransport, endQuery } from "./query-teardown.js";
 import { consumeWithWatchdog, describeSummaryStop } from "./summary-guard.js";
 import { resolveSpawnableCli } from "./cli-path.js";
+import { applyServedWindows, readServedWindows, recordServedWindow } from "./served-context.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -907,6 +908,22 @@ function logServedContextWindow(label: string, message: CbMessage, model: Model<
 	for (const [k, v] of Object.entries(modelUsage)) {
 		debug(`${label}: served contextWindow=${v.contextWindow ?? "?"} maxOutputTokens=${v.maxOutputTokens ?? "?"} servedModel=${k} registered=${model.contextWindow}`);
 	}
+	// The SDK's model list carries no window, so the registered contextWindow is
+	// a name-based guess until the CLI tells us otherwise. Persist the truth so
+	// the next session registers it and stops compacting on the guess.
+	const served = modelUsage[codebuddyModelId(model)] ?? Object.values(modelUsage)[0];
+	if (!served) return;
+	const before = readServedWindows()[codebuddyModelId(model)]?.contextWindow;
+	const entry = recordServedWindow(codebuddyModelId(model), {
+		contextWindow: served.contextWindow,
+		maxOutputTokens: served.maxOutputTokens,
+	});
+	if (!entry) return;
+	if (entry.contextWindow === before && entry.maxOutputTokens === readServedWindows()[codebuddyModelId(model)]?.maxOutputTokens) return;
+	debug(
+		`${label}: learned served window for ${codebuddyModelId(model)}: ` +
+		`contextWindow ${before ?? "?"} → ${entry.contextWindow}, maxTokens → ${entry.maxOutputTokens ?? "?"}`,
+	);
 }
 
 // --- Effort level mapping ---
@@ -1751,6 +1768,7 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 				rawModelsFromSdk(supported as any),
 				providerSettings.modelOverrides ? undefined : providerSettings,
 				providerSettings.modelOverrides,
+				readServedWindows(),
 			);
 			// Persist the successful discovery globally so a later session
 			// resume (module reload) can recover the real model list even if
@@ -1821,7 +1839,9 @@ export default async function (pi: ExtensionAPI) {
 	// or across processes (`pi -r` after exit).
 	const cached = readModelsCache();
 	if (cached && cached.length) {
-		MODELS = cached;
+		// The cache stores built models, window guesses included. Re-apply anything
+		// the CLI has since taught us before this list becomes the registered one.
+		MODELS = applyServedWindows(cached, readServedWindows());
 		debug(`default: recovered ${MODELS.length} cached models from prior discovery`);
 	} else {
 		MODELS = buildModels(FALLBACK_MODELS, providerSettings, providerSettings.modelOverrides);
