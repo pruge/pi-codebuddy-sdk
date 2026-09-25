@@ -30,6 +30,17 @@ export class QueryContext {
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
+	/**
+	 * Size of the context pi actually sent for this turn, in tokens.
+	 *
+	 * pi derives its context gauge and its compaction threshold from
+	 * `usage.totalTokens`, not from the message list — so whatever a provider
+	 * puts there becomes "the context size". A session-scoped runtime tally
+	 * (CodeBuddy resumes one CLI session and reports its running prompt) is
+	 * not that number, and feeding it back made pi compact 121 times on a
+	 * context that had actually shrunk to 10k. See estimatePiContextTokens().
+	 */
+	turnContextTokens = 0;
 
 	get turnBlocks(): Array<any> {
 		if (!this.turnOutput) throw new Error("turnBlocks accessed before resetTurnState");
@@ -47,6 +58,7 @@ export class QueryContext {
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
+		this.turnContextTokens = 0;
 		// turnToolCallIds and nextHandlerIdx are NOT reset — they persist across
 		// tool-result delivery callbacks within the same assistant message.
 	}
