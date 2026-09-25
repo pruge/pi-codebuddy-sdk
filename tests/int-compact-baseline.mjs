@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
 const TIMEOUT = 180_000;
-const BRIDGE_MODEL = "codebuddy/hy3-preview-agent-ioa";
+const BRIDGE_MODEL = "codebuddy/deepseek-v4.1-flash";
 
 const testAgentDir = mkdtempSync(join(tmpdir(), "compact-baseline-agent-"));
 writeFileSync(join(testAgentDir, "settings.json"), JSON.stringify({

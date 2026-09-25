@@ -37,7 +37,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRpcHarness } from "./lib/rpc-harness.mjs";
 
-const BRIDGE_MODEL = "codebuddy/hy3-preview-agent-ioa";
+const BRIDGE_MODEL = "codebuddy/deepseek-v4.1-flash";
 const COMPACT_TIMEOUT = 90_000; // compact should finish in ~10s; hang = timeout
 const TEST_TIMEOUT = 180_000;
 
