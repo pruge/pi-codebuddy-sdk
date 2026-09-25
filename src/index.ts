@@ -21,6 +21,7 @@ import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askcodebuddy-ui.js";
 import { withSdkGate } from "./sdk-gate.js";
 import { closeQueryTransport, endQuery } from "./query-teardown.js";
+import { resolveSpawnableCli } from "./cli-path.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -418,7 +419,13 @@ async function runIsolatedSummary(
 		const view = readTranscript(context);
 		const promptText = extractIsolatedSummaryPrompt(view.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-		const codebuddyExecutable = loadConfig(cwd).provider?.pathToCodebuddyCode;
+		const cliPath = resolveSpawnableCli(loadConfig(cwd).provider?.pathToCodebuddyCode);
+		if (cliPath.kind === "error") {
+			diagDump("compact_summary_cli_unresolved", { reason: cliPath.reason });
+			throw new Error(cliPath.reason);
+		}
+		debug(`compact summary: cli ${cliPath.source} ${cliPath.path} → ${cliPath.rewrittenTo}`);
+		const codebuddyExecutable = cliPath.path;
 		const cliModel = codebuddyModelId(model);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
@@ -1339,7 +1346,13 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 		? undefined
 		: providerSettings.settingSources ?? ["user", "project"];
 	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
-	const codebuddyExecutable = providerSettings.pathToCodebuddyCode;
+	// Resolve before handing the path to the SDK: it rewrites any ".../bin/codebuddy"
+	// to a sibling "dist/codebuddy-headless.js" by string match, without following
+	// symlinks, so a shim path spawns a file that does not exist.
+	const cliPath = resolveSpawnableCli(providerSettings.pathToCodebuddyCode);
+	if (cliPath.kind === "error") debug(`codebuddy CLI unresolved, falling back to SDK resolution: ${cliPath.reason}`);
+	else debug(`codebuddy CLI: ${cliPath.source} ${cliPath.path} → ${cliPath.rewrittenTo}`);
+	const codebuddyExecutable = cliPath.kind === "ok" ? cliPath.path : undefined;
 
 	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
 	// per-model overrides — e.g. opus-4-7 wants xhigh→xhigh, not xhigh→max).
