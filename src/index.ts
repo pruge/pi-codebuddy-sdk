@@ -21,6 +21,7 @@ import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askcodebuddy-ui.js";
 import { withSdkGate } from "./sdk-gate.js";
 import { closeQueryTransport, endQuery } from "./query-teardown.js";
+import { consumeWithWatchdog, describeSummaryStop } from "./summary-guard.js";
 import { resolveSpawnableCli } from "./cli-path.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
@@ -401,6 +402,16 @@ function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleS
 	return stream;
 }
 
+// Deadlines for the compaction summarizer CLI subprocess.
+//
+// Measured on a 300k-token compaction prompt: the CLI needs ~40s to stream its
+// first events and ~40s total. The defaults therefore sit far above the observed
+// cost — they exist to convert an unbounded wait into a loud failure, not to
+// speed anything up. Override via provider.summaryFirstEventTimeoutMs /
+// provider.summaryTotalTimeoutMs in codebuddy-sdk.json.
+const SUMMARY_FIRST_EVENT_TIMEOUT_MS = 120_000;
+const SUMMARY_TOTAL_TIMEOUT_MS = 600_000;
+
 async function runIsolatedSummary(
 	model: Model<any>,
 	context: Context,
@@ -408,18 +419,16 @@ async function runIsolatedSummary(
 	stream: AssistantMessageEventStream,
 ): Promise<void> {
 	let sdkQuery: ReturnType<typeof query> | undefined;
-	let wasAborted = false;
-	const onAbort = () => {
-		wasAborted = true;
-		void sdkQuery?.interrupt().catch(() => {});
-		try { sdkQuery?.interrupt(); } catch {}
+	const interruptQuery = () => {
+		try { void sdkQuery?.interrupt?.()?.catch?.(() => {}); } catch { /* half-dead query */ }
 	};
 
 	try {
 		const view = readTranscript(context);
 		const promptText = extractIsolatedSummaryPrompt(view.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-		const cliPath = resolveSpawnableCli(loadConfig(cwd).provider?.pathToCodebuddyCode);
+		const providerConfig = loadConfig(cwd).provider ?? {};
+		const cliPath = resolveSpawnableCli(providerConfig.pathToCodebuddyCode);
 		if (cliPath.kind === "error") {
 			diagDump("compact_summary_cli_unresolved", { reason: cliPath.reason });
 			throw new Error(cliPath.reason);
@@ -427,7 +436,16 @@ async function runIsolatedSummary(
 		debug(`compact summary: cli ${cliPath.source} ${cliPath.path} → ${cliPath.rewrittenTo}`);
 		const codebuddyExecutable = cliPath.path;
 		const cliModel = codebuddyModelId(model);
-		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
+		const firstEventTimeoutMs = providerConfig.summaryFirstEventTimeoutMs ?? SUMMARY_FIRST_EVENT_TIMEOUT_MS;
+		const totalTimeoutMs = providerConfig.summaryTotalTimeoutMs ?? SUMMARY_TOTAL_TIMEOUT_MS;
+		debug(
+			`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length} ` +
+			`firstEventTimeoutMs=${firstEventTimeoutMs} totalTimeoutMs=${totalTimeoutMs}`,
+		);
+
+		// A large compaction takes a minute on this bridge. Say so, or it reads
+		// as a hang.
+		piUI?.setStatus?.("codebuddy-compact", "CodeBuddy: summarizing context…");
 
 		sdkQuery = startQuery({
 			prompt: promptText,
@@ -441,46 +459,68 @@ async function runIsolatedSummary(
 				systemPrompt: view.systemPrompt,
 				model: cliModel,
 				maxTurns: 1,
+				// Deliberately NOT setting requestTimeoutMs: the SDK forwards it to
+				// the child as --request-timeout-ms, which CodeBuddy CLI 2.158.0
+				// rejects ("unknown option") and exits at once, surfacing as
+				// "CLI process stdout closed unexpectedly". The watchdog above is
+				// the only bound we can enforce from this side.
 				...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
 				...makeCliDebugOptions("compact-summary"),
 			},
 		});
 
-		if (options?.signal) {
-			if (options.signal.aborted) onAbort();
-			else options.signal.addEventListener("abort", onAbort, { once: true });
-		}
-
 		let assistantText = "";
 		let finalText = "";
 		let errorText: string | undefined;
-		let firstEventLogged = false;
 
-		for await (const message of sdkQuery) {
-			if (!firstEventLogged) {
-				debug(`compact summary: first event type=${message.type}`);
-				firstEventLogged = true;
-			}
-			if (wasAborted) break;
+		const stop = await consumeWithWatchdog<CbMessage>(sdkQuery, {
+			firstEventTimeoutMs,
+			totalTimeoutMs,
+			signal: options?.signal,
+			onFirstEvent: () => {
+				debug("compact summary: first CLI event received");
+				piUI?.setStatus?.("codebuddy-compact", "CodeBuddy: writing summary…");
+			},
+			onMessage: (message) => {
+				if (message.type === "assistant") {
+					for (const block of (message as any).message?.content ?? []) {
+						if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
+					}
+				} else if (message.type === "result") {
+					logServedContextWindow("compact summary", message, model);
+					if (message.subtype === "success") {
+						finalText = message.result || assistantText;
+					} else {
+						errorText = resultErrorText(message);
+					}
+				}
+			},
+		});
 
-			if (message.type === "assistant") {
-				for (const block of (message as any).message?.content ?? []) {
-					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
-				}
-			} else if (message.type === "result") {
-				logServedContextWindow("compact summary", message, model);
-				if (message.subtype === "success") {
-					finalText = message.result || assistantText;
-				} else {
-					errorText = resultErrorText(message);
-				}
-			}
+		if (stop.kind !== "completed") {
+			// A wedged CLI never answers interrupt(), so tear it down explicitly
+			// instead of waiting on a control round-trip that will never answer.
+			interruptQuery();
+			diagDump("compact_summary_stopped", {
+				kind: stop.kind,
+				promptLen: promptText.length,
+				model: cliModel,
+				firstEventTimeoutMs,
+				totalTimeoutMs,
+			});
 		}
 
-		if (wasAborted) {
-			const output = newAssistantOutput(model, "", "aborted", "Operation aborted");
+		if (stop.kind === "aborted") {
 			debug("compact summary: aborted");
-			stream.push({ type: "error", reason: "aborted", error: output });
+			stream.push({ type: "error", reason: "aborted", error: newAssistantOutput(model, "", "aborted", "Operation aborted") });
+			stream.end();
+			return;
+		}
+
+		if (stop.kind !== "completed") {
+			const msg = describeSummaryStop(stop);
+			debug(`compact summary: ${stop.kind} — ${msg}`);
+			stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
 			stream.end();
 			return;
 		}
@@ -503,7 +543,7 @@ async function runIsolatedSummary(
 		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
 		stream.end();
 	} finally {
-		options?.signal?.removeEventListener("abort", onAbort);
+		piUI?.setStatus?.("codebuddy-compact", undefined);
 		endQuery(sdkQuery, "compact-summary", { log: debug });
 	}
 }

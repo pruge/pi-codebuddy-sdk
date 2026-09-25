@@ -38,6 +38,16 @@ export interface Config {
 			reasoning?: boolean;
 			images?: boolean;
 		}>;
+		/**
+		 * Deadline for the first message from a CodeBuddy CLI subprocess.
+		 * Bounds the "CLI started but never spoke" wedge. Default 120000.
+		 */
+		summaryFirstEventTimeoutMs?: number;
+		/**
+		 * Deadline for a whole CodeBuddy CLI subprocess run, first event or not.
+		 * Bounds an unbounded turn. Default 600000.
+		 */
+		summaryTotalTimeoutMs?: number;
 	};
 }
 
