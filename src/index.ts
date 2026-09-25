@@ -1,6 +1,6 @@
 import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
-import { buildSessionContext, compact, estimateTokens, keyHint, type CompactionEntry, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, compact, keyHint, type CompactionEntry, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { createSdkMcpServer, query, type Effort, type Message as CbMessage, type UserMessage as CbUserMessage } from "@tencent-ai/agent-sdk";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
@@ -880,24 +880,7 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 
 // --- Usage helpers ---
 
-/**
- * Size of the context pi sent, in tokens, via pi's own estimator.
- *
- * Deliberately the same function pi falls back to when it has no trustworthy
- * usage, so the number this bridge reports and the number pi would have
- * computed on its own cannot drift apart.
- */
-function estimatePiContextTokens(systemPrompt: string | undefined, messages: unknown[]): number {
-	let total = 0;
-	if (systemPrompt) total += estimateTokens({ role: "system", content: systemPrompt } as never);
-	for (const message of messages) {
-		if ((message as { role?: string })?.role === "system") continue;
-		total += estimateTokens(message as never);
-	}
-	return total;
-}
-
-function updateUsage(output: AssistantMessage, usage: Record<string, number | undefined>, model: Model<any>, contextTokens?: number): void {
+function updateUsage(output: AssistantMessage, usage: Record<string, number | undefined>, model: Model<any>): void {
 	if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
 	if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
 	if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
@@ -905,20 +888,7 @@ function updateUsage(output: AssistantMessage, usage: Record<string, number | un
 	// CodeBuddy may report reasoning/thinking tokens separately, while pi's Usage type does not model that field.
 	const reasoning = usage.reasoning_tokens ?? usage.thinking_tokens;
 	if (reasoning != null) (output.usage as typeof output.usage & { reasoning?: number }).reasoning = reasoning;
-	// input / output / cacheRead / cacheWrite stay exactly as the CLI reported them —
-	// calculateCost() below bills from those, so cost accounting is unaffected.
-	//
-	// totalTokens is the one field pi reads as "how full is the context" (see
-	// calculateContextTokens → estimateProjectedContextTokens → shouldCompact), and the
-	// CLI's numbers do not mean that: the CLI is resumed across turns, so its input and
-	// cacheRead describe the whole CLI session, which keeps growing after pi compacts.
-	// Reporting them verbatim made pi display 257k for a 10k context and re-compact
-	// every turn (121 compactions in one session). Report pi's own context size
-	// instead. Falls back to the CLI's sum only when we have no estimate this turn.
-	output.usage.totalTokens =
-		typeof contextTokens === "number" && contextTokens > 0
-			? contextTokens
-			: output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+	output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 	calculateCost(model, output.usage);
 	const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
 	const cachePct = promptTokens > 0 ? Math.round(output.usage.cacheRead / promptTokens * 100) : 0;
@@ -1041,7 +1011,7 @@ function processStreamEvent(
 	if (event?.type === "message_start") {
 		c.turnToolCallIds = [];
 		c.nextHandlerIdx = 0;
-		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model, c.turnContextTokens);
+		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model);
 		return;
 	}
 
@@ -1124,7 +1094,7 @@ function processStreamEvent(
 
 	if (event?.type === "message_delta") {
 		c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
-		if (event.usage) updateUsage(c.turnOutput, event.usage, model, c.turnContextTokens);
+		if (event.usage) updateUsage(c.turnOutput, event.usage, model);
 		return;
 	}
 
@@ -1196,7 +1166,7 @@ function processAssistantMessage(message: CbMessage, model: Model<any>, customTo
 			debug("processAssistantMessage: unhandled block type", block.type);
 		}
 	}
-	if (assistantMsg.usage && c.turnOutput) updateUsage(c.turnOutput, assistantMsg.usage, model, c.turnContextTokens);
+	if (assistantMsg.usage && c.turnOutput) updateUsage(c.turnOutput, assistantMsg.usage, model);
 
 	// End the stream on tool_use, same as processStreamEvent's message_stop handler.
 	if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
@@ -1292,10 +1262,6 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const lastMsgRole = convoMessages[convoMessages.length - 1]?.role;
 	debug(`provider: streamCodebuddySdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${ctx().activeQuery !== null}`);
 
-	// Computed once per provider call: every usage event in this turn reports it.
-	const piContextTokens = estimatePiContextTokens(baseSystemPrompt, convoMessages);
-	debug(`provider: pi context estimate=${piContextTokens} tokens (system=${baseSystemPrompt?.length ?? 0} chars, msgs=${convoMessages.length})`);
-
 	const activeQuery = ctx().activeQuery !== null;
 	const allResults = activeQueryContexts.size > 0 ? extractAllToolResults(context) : [];
 	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
@@ -1311,7 +1277,6 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	if (resultCtx) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
-		resultCtx.turnContextTokens = piContextTokens;
 		debug(`provider: tool results, ${allResults.length} results, ${resultCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${convoMessages.length}`);
 		for (const result of allResults) {
 			const id = result.toolCallId;
@@ -1373,7 +1338,6 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 		const c = ctx();  // capture current context for the microtask
 		queueMicrotask(() => {
 			c.resetTurnState(model);
-			c.turnContextTokens = piContextTokens;
 			stream.push({ type: "done", reason: "stop", message: c.turnOutput });
 			markStreamComplete(stream);
 			stream.end();
@@ -1396,7 +1360,6 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	queryCtx.pendingResults.clear();
 	queryCtx.deferredUserMessages = [];
 	queryCtx.resetTurnState(model);
-	queryCtx.turnContextTokens = piContextTokens;
 	queryCtx.latestCursor = 0;
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(declaredTools, askCodebuddyToolName);
@@ -1549,13 +1512,6 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 				const steerPrompt = queryCtx.deferredUserMessages.shift()!;
 				debug(`provider: replaying deferred user message (len=${steerPrompt.length})`);
 				queryCtx.resetTurnState(model);
-				// The deferred message is appended to pi's context before we get
-				// here, so this turn's estimate is larger than the one the
-				// previous turn used. Recompute rather than carry the old value.
-				queryCtx.turnContextTokens = estimatePiContextTokens(baseSystemPrompt, [
-					...convoMessages,
-					{ role: "user", content: [{ type: "text", text: steerPrompt }] },
-				]);
 
 				const resumeId = sharedSession?.sessionId;
 				if (!resumeId) {
