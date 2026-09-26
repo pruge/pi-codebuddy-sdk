@@ -20,6 +20,7 @@ import { loadConfig, type Config } from "./config.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askcodebuddy-ui.js";
 import { withSdkGate } from "./sdk-gate.js";
+import { estimatePiContextTokens } from "./context-tokens.js";
 import { closeQueryTransport, endQuery } from "./query-teardown.js";
 import { consumeWithWatchdog, describeSummaryStop } from "./summary-guard.js";
 import { resolveSpawnableCli } from "./cli-path.js";
@@ -880,6 +881,12 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 
 // --- Usage helpers ---
 
+// Context size for the request currently in flight, computed from pi's own
+// messages. Set once per request right after readTranscript; read by updateUsage
+// for every usage event of that turn. See context-tokens.ts for why the CLI's
+// reported number cannot be used here.
+let piContextTokens = 0;
+
 function updateUsage(output: AssistantMessage, usage: Record<string, number | undefined>, model: Model<any>): void {
 	if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
 	if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
@@ -888,7 +895,9 @@ function updateUsage(output: AssistantMessage, usage: Record<string, number | un
 	// CodeBuddy may report reasoning/thinking tokens separately, while pi's Usage type does not model that field.
 	const reasoning = usage.reasoning_tokens ?? usage.thinking_tokens;
 	if (reasoning != null) (output.usage as typeof output.usage & { reasoning?: number }).reasoning = reasoning;
-	output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+	// Fall back to the request's own uncached input+output if no transcript has
+	// been read yet (isolated summarizer runs, defensive paths).
+	output.usage.totalTokens = piContextTokens > 0 ? piContextTokens : (output.usage.input + output.usage.output);
 	calculateCost(model, output.usage);
 	const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
 	const cachePct = promptTokens > 0 ? Math.round(output.usage.cacheRead / promptTokens * 100) : 0;
@@ -1257,6 +1266,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	// Upstream #9548: pi-ai >= 0.85.2 passes a normalized transcript (prompt + tools carried by
 	// system messages). Read both shapes so this provider works before and after that change.
 	const { messages: convoMessages, systemPrompt: baseSystemPrompt, tools: declaredTools } = readTranscript(context);
+	piContextTokens = estimatePiContextTokens(convoMessages as never, baseSystemPrompt);
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = convoMessages[convoMessages.length - 1]?.role;
