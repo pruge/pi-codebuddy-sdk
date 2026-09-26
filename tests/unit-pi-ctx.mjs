@@ -135,7 +135,7 @@ describe("readPiCtxWindows", () => {
 			readFile: () => `${bin}\n`,
 			run: async (actualBin, args) => {
 				calls.push({ actualBin, args });
-				return { ok: true, stdout: JSON.stringify({ windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }) };
+				return { ok: true, stdout: JSON.stringify({ format: 1, windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }) };
 			},
 		};
 		assert.deepEqual(await readPiCtxWindows(deps), { "codebuddy/hy3": { contextWindow: 192_000 } });
@@ -145,13 +145,13 @@ describe("readPiCtxWindows", () => {
 	it("parses the windows out of status --json", async () => {
 		const { deps } = harness({
 			ok: true,
-			stdout: JSON.stringify({ path: "/p", windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }),
+			stdout: JSON.stringify({ format: 1, path: "/p", windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }),
 		});
 		assert.deepEqual(await readPiCtxWindows(deps), { "codebuddy/hy3": { contextWindow: 192_000 } });
 	});
 
 	it("execs status --json only once per process", async () => {
-		const { deps, calls } = harness({ ok: true, stdout: JSON.stringify({ windows: {} }) });
+		const { deps, calls } = harness({ ok: true, stdout: JSON.stringify({ format: 1, windows: {} }) });
 		await readPiCtxWindows(deps);
 		await readPiCtxWindows(deps);
 		assert.deepEqual(calls.map((c) => c.args), [["status", "--json"]]);
@@ -177,7 +177,48 @@ describe("readPiCtxWindows", () => {
 	});
 
 	it("returns an empty list when windows is not an object", async () => {
-		const { deps } = harness({ ok: true, stdout: JSON.stringify({ windows: [1, 2] }) });
+		const { deps, problems } = harness({ ok: true, stdout: JSON.stringify({ format: 1, windows: [1, 2] }) });
 		assert.deepEqual(await readPiCtxWindows(deps), {});
+		assert.equal(problems.length, 1);
+		assert.match(problems[0], /windows/);
+	});
+
+	it("ignores a response with no format version instead of guessing", async () => {
+		const { deps, problems } = harness({ ok: true, stdout: JSON.stringify({ windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }) });
+		assert.deepEqual(await readPiCtxWindows(deps), {});
+		assert.equal(problems.length, 1);
+		assert.match(problems[0], /no format version/);
+	});
+
+	it("ignores a newer format and says the key rules may differ", async () => {
+		const { deps, problems } = harness({ ok: true, stdout: JSON.stringify({ format: 2, windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }) });
+		assert.deepEqual(await readPiCtxWindows(deps), {});
+		assert.equal(problems.length, 1);
+		assert.match(problems[0], /newer/);
+	});
+
+	it("ignores an older format", async () => {
+		const { deps, problems } = harness({ ok: true, stdout: JSON.stringify({ format: 0, windows: {} }) });
+		assert.deepEqual(await readPiCtxWindows(deps), {});
+		assert.equal(problems.length, 1);
+		assert.match(problems[0], /older/);
+	});
+
+	it("warns and skips keys that are not provider/model", async () => {
+		const { deps, problems } = harness({
+			ok: true,
+			stdout: JSON.stringify({
+				format: 1,
+				windows: {
+					"codebuddy/hy3": { contextWindow: 192_000 },
+					"bare-model": { contextWindow: 128_000 },
+					"a/b/c": { contextWindow: 64_000 },
+					"provider/": { contextWindow: 32_000 },
+				},
+			}),
+		});
+		assert.deepEqual(await readPiCtxWindows(deps), { "codebuddy/hy3": { contextWindow: 192_000 } });
+		assert.equal(problems.length, 3);
+		assert.match(problems[0], /bare-model/);
 	});
 });

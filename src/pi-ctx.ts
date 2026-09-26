@@ -22,7 +22,15 @@ import { homedir } from "os";
 import { delimiter, isAbsolute, join } from "path";
 import { PROVIDER_ID } from "./convert.js";
 
-/** One learned window, as `pi-ctx status --json` reports it. */
+/**
+ * The `pi-ctx status --json` contract version this package understands.
+ * Integer, matching pi-ctx's FORMAT_VERSION on purpose: a consumer branches on
+ * the number, and a SemVer string would add parsing without adding safety.
+ */
+const SUPPORTED_FORMAT = 1;
+
+/**
+ * One learned window, as `pi-ctx status --json` reports it. */
 export type PiCtxWindow = { contextWindow: number; maxOutputTokens?: number };
 export type PiCtxWindows = Record<string, PiCtxWindow>;
 
@@ -143,6 +151,11 @@ export async function observeWindow(
  *
  * Any failure — no binary, non-zero exit, bad JSON — is an empty list, which is
  * exactly "nothing learned yet". The SDK must work with pi-ctx absent.
+ *
+ * On a format mismatch the fallback is also empty, which the registration path
+ * treats as "no learned window" and keeps the wide fallback (1M). Widening is
+ * only a delay; narrowing an unknown model is unrecoverable for the session it
+ * starves, so this package defaults wide and lets pi-ctx own the corrections.
  */
 export function readPiCtxWindows(deps: PiCtxDeps = {}): Promise<PiCtxWindows> {
 	const key = resolvePiCtxBin(deps) ?? "";
@@ -151,10 +164,41 @@ export function readPiCtxWindows(deps: PiCtxDeps = {}): Promise<PiCtxWindows> {
 	const promise = call(["status", "--json"], deps).then((result) => {
 		if (!result.ok) return {};
 		try {
-			const parsed = JSON.parse(result.stdout) as { windows?: unknown };
+			const parsed = JSON.parse(result.stdout) as { format?: unknown; windows?: unknown };
+			if (typeof parsed?.format !== "number") {
+				// M1's bug was a parse that succeeded and was silently dropped. A
+				// missing version must be loud, not treated as "the old format".
+				warnOnce(deps, "status-format-missing", "pi-ctx status --json has no format version; ignoring its windows (update pi-ctx)");
+				return {};
+			}
+			if (parsed.format > SUPPORTED_FORMAT) {
+				// A newer format may use unknown key rules — reading it anyway would
+				// repeat exactly the silently-dropped-keys failure.
+				warnOnce(deps, `status-format-${parsed.format}`, `pi-ctx status --json format ${parsed.format} is newer than supported ${SUPPORTED_FORMAT}; ignoring its windows (update pi-codebuddy-sdk)`);
+				return {};
+			}
+			if (parsed.format < SUPPORTED_FORMAT) {
+				warnOnce(deps, `status-format-${parsed.format}`, `pi-ctx status --json format ${parsed.format} is older than supported ${SUPPORTED_FORMAT}; ignoring its windows (update pi-ctx)`);
+				return {};
+			}
 			const windows = parsed?.windows;
-			if (!windows || typeof windows !== "object" || Array.isArray(windows)) return {};
-			return windows as PiCtxWindows;
+			if (!windows || typeof windows !== "object" || Array.isArray(windows)) {
+				warnOnce(deps, "status-windows", "pi-ctx status --json format 1 has no windows object; treating the learned windows as empty");
+				return {};
+			}
+			const learned: PiCtxWindows = {};
+			for (const [name, entry] of Object.entries(windows as PiCtxWindows)) {
+				const [provider, ...rest] = name.split("/");
+				if (!provider || rest.length !== 1 || !rest[0]) {
+					// Keys are provider/model; anything else is unreadable by design,
+					// and dropping it silently is the failure this contract exists to
+					// prevent.
+					warnOnce(deps, `status-key:${name}`, `pi-ctx reported a window under key "${name}", which is not provider/model; ignoring it`);
+					continue;
+				}
+				learned[name] = entry;
+			}
+			return learned;
 		} catch {
 			warnOnce(deps, "status-json", "pi-ctx status --json was not valid JSON; treating the learned windows as empty");
 			return {};
