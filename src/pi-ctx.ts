@@ -1,0 +1,152 @@
+// The pi-ctx bridge: report what the CodeBuddy CLI served, and read back the
+// windows pi-ctx has learned.
+//
+// pi-ctx is the single authority for context-window sizes. This package is only
+// the observer: it knows the CLI's `result.modelUsage` shape, and it knows how
+// to call the pi-ctx CLI. It deliberately knows nothing about the store's path,
+// shape, or plausibility rules — `pi-ctx status --json` is the only format here,
+// so the store can change without silently breaking this package.
+//
+// Why exec and not import: packages here must not import each other; the
+// boundary is the CLI (and the file). Why not read the store file directly: that
+// would duplicate the format knowledge the CLI already owns. Direct reading
+// stays a possible later optimization, not the default.
+//
+// Nothing here may break a turn. A missing binary, a non-zero exit, a timeout,
+// or unparseable output all collapse to "no observation" / "no learned windows",
+// and each distinct problem is logged at most once.
+
+import { execFile } from "child_process";
+import { existsSync } from "fs";
+import { delimiter, join } from "path";
+import { PROVIDER_ID } from "./convert.js";
+
+/** One learned window, as `pi-ctx status --json` reports it. */
+export type PiCtxWindow = { contextWindow: number; maxOutputTokens?: number };
+export type PiCtxWindows = Record<string, PiCtxWindow>;
+
+export type PiCtxRun = { ok: boolean; stdout: string; reason?: string };
+
+export type PiCtxDeps = {
+	env?: Record<string, string | undefined>;
+	exists?: (path: string) => boolean;
+	/** Injected so the rules stay unit-testable without spawning anything. */
+	run?: (bin: string, args: string[]) => Promise<PiCtxRun>;
+	timeoutMs?: number;
+	/** Where a one-time problem report goes; defaults to silence. */
+	onProblem?: (message: string) => void;
+};
+
+const DEFAULT_TIMEOUT_MS = 3_000;
+
+/** In-process state on globalThis so a test can clear it like the old cache. */
+const STATE_KEY = Symbol.for("codebuddy-sdk:piCtxState");
+type PiCtxState = { read?: { key: string; promise: Promise<PiCtxWindows> }; warned: Set<string> };
+
+function state(): PiCtxState {
+	const holder = globalThis as unknown as Record<symbol, PiCtxState | undefined>;
+	return (holder[STATE_KEY] ??= { warned: new Set<string>() });
+}
+
+function warnOnce(deps: PiCtxDeps, problem: string, message: string): void {
+	const warned = state().warned;
+	if (warned.has(problem)) return;
+	warned.add(problem);
+	deps.onProblem?.(message);
+}
+
+/**
+ * Where the pi-ctx CLI is: `PI_CTX_BIN` first, then `pi-ctx` on PATH. Undefined
+ * means "not installed", which is a supported state — observation is skipped and
+ * the SDK keeps working on its own fallback window.
+ */
+export function resolvePiCtxBin(deps: PiCtxDeps = {}): string | undefined {
+	const env = deps.env ?? process.env;
+	const exists = deps.exists ?? existsSync;
+	const explicit = env.PI_CTX_BIN;
+	if (explicit && exists(explicit)) return explicit;
+	const name = process.platform === "win32" ? "pi-ctx.cmd" : "pi-ctx";
+	for (const dir of (env.PATH ?? env.Path ?? "").split(delimiter)) {
+		if (!dir) continue;
+		const candidate = join(dir, name);
+		if (exists(candidate)) return candidate;
+	}
+	return undefined;
+}
+
+function defaultRun(timeoutMs: number) {
+	return (bin: string, args: string[]): Promise<PiCtxRun> =>
+		new Promise((resolve) => {
+			execFile(bin, args, { timeout: timeoutMs }, (error, stdout) => {
+				if (error) resolve({ ok: false, stdout: String(stdout ?? ""), reason: error.message });
+				else resolve({ ok: true, stdout: String(stdout ?? "") });
+			});
+		});
+}
+
+/** Run the CLI once. Never throws and never rejects. */
+async function call(args: string[], deps: PiCtxDeps): Promise<PiCtxRun> {
+	const bin = resolvePiCtxBin(deps);
+	if (!bin) {
+		warnOnce(deps, "not-found", "pi-ctx not found (set PI_CTX_BIN or put pi-ctx on PATH); window observations are skipped");
+		return { ok: false, stdout: "", reason: "pi-ctx not found" };
+	}
+	const run = deps.run ?? defaultRun(deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+	try {
+		const result = await run(bin, args);
+		if (!result.ok) warnOnce(deps, `exec:${args[0]}`, `pi-ctx ${args[0]} failed (${result.reason ?? "unknown"}); continuing without it`);
+		return result;
+	} catch (error) {
+		warnOnce(deps, `exec:${args[0]}`, `pi-ctx ${args[0]} failed (${(error as Error).message}); continuing without it`);
+		return { ok: false, stdout: "", reason: (error as Error).message };
+	}
+}
+
+/**
+ * Report one observation to pi-ctx. Fire-and-forget: the caller does not await
+ * it, and a failure is a lost observation, never a broken turn.
+ *
+ * The plausible range is pi-ctx's rule, not this package's — a garbage number is
+ * passed through and refused on the other side, so the rule lives in one place.
+ * A non-number is dropped here because there is nothing to report at all.
+ */
+export async function observeWindow(
+	modelId: string,
+	reported: { contextWindow?: number; maxOutputTokens?: number },
+	deps: PiCtxDeps = {},
+): Promise<void> {
+	const raw = reported.contextWindow;
+	if (typeof raw !== "number" || !Number.isFinite(raw)) return;
+	const args = ["observe", "--provider", PROVIDER_ID, "--model", modelId, "--window", String(Math.floor(raw))];
+	const max = reported.maxOutputTokens;
+	if (typeof max === "number" && Number.isFinite(max) && max > 0) args.push("--max-output", String(Math.floor(max)));
+	await call(args, deps);
+}
+
+/**
+ * Read the windows pi-ctx has learned. One `pi-ctx status --json` per process:
+ * the module-load path and the discovery path both need this, and a second exec
+ * would only repeat the same answer.
+ *
+ * Any failure — no binary, non-zero exit, bad JSON — is an empty list, which is
+ * exactly "nothing learned yet". The SDK must work with pi-ctx absent.
+ */
+export function readPiCtxWindows(deps: PiCtxDeps = {}): Promise<PiCtxWindows> {
+	const key = resolvePiCtxBin(deps) ?? "";
+	const cached = state().read;
+	if (cached?.key === key) return cached.promise;
+	const promise = call(["status", "--json"], deps).then((result) => {
+		if (!result.ok) return {};
+		try {
+			const parsed = JSON.parse(result.stdout) as { windows?: unknown };
+			const windows = parsed?.windows;
+			if (!windows || typeof windows !== "object" || Array.isArray(windows)) return {};
+			return windows as PiCtxWindows;
+		} catch {
+			warnOnce(deps, "status-json", "pi-ctx status --json was not valid JSON; treating the learned windows as empty");
+			return {};
+		}
+	});
+	state().read = { key, promise };
+	return promise;
+}

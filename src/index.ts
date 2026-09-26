@@ -9,7 +9,7 @@ import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
-import { buildModels, codebuddyModelId, FALLBACK_MODELS, rawModelsFromSdk, resolveModel as _resolveModel, type PiModel } from "./models.js";
+import { applyWindows, buildModels, codebuddyModelId, FALLBACK_MODELS, rawModelsFromSdk, resolveModel as _resolveModel, type PiModel } from "./models.js";
 import { readModelsCache, writeModelsCache } from "./models-cache.js";
 import { readTranscript } from "./transcript-compat.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, buildCodebuddySystemPrompt } from "./skills.js";
@@ -24,7 +24,7 @@ import { estimatePiContextTokens } from "./context-tokens.js";
 import { closeQueryTransport, endQuery } from "./query-teardown.js";
 import { consumeWithWatchdog, describeSummaryStop } from "./summary-guard.js";
 import { resolveSpawnableCli } from "./cli-path.js";
-import { applyServedWindows, readServedWindows, recordServedWindow } from "./served-context.js";
+import { observeWindow, readPiCtxWindows } from "./pi-ctx.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -81,6 +81,10 @@ function debug(...args: unknown[]) {
 	const msg = args.map(fmt).join(" ");
 	appendFileSync(DEBUG_LOG_PATH, `[${ts}] [${moduleInstanceId}] ${msg}\n`);
 }
+
+// pi-ctx is an observer boundary: a problem there belongs in the debug log and
+// must never reach the user's turn.
+const piCtxDeps = { onProblem: (message: string) => debug(message) };
 
 // Per-query CLI debug capture. When CODEBUDDY_SDK_DEBUG=1, ask the CodeBuddy CLI
 // subprocess to write its own debug log locally. We do not forward stderr (may
@@ -961,21 +965,20 @@ function logServedContextWindow(label: string, message: CbMessage, model: Model<
 	for (const [k, v] of Object.entries(modelUsage)) {
 		debug(`${label}: served contextWindow=${v.contextWindow ?? "?"} maxOutputTokens=${v.maxOutputTokens ?? "?"} servedModel=${k} registered=${model.contextWindow}`);
 	}
-	// The SDK's model list carries no window, so the registered contextWindow is
-	// a name-based guess until the CLI tells us otherwise. Persist the truth so
-	// the next session registers it and stops compacting on the guess.
+	// The result's modelUsage is otherwise discarded; report it to pi-ctx, which
+	// owns the store and the plausibility rules. Fire-and-forget: a missing
+	// pi-ctx or a failed exec is a lost observation, never a broken turn.
 	const served = modelUsage[codebuddyModelId(model)] ?? Object.values(modelUsage)[0];
 	if (!served) return;
-	const before = readServedWindows()[codebuddyModelId(model)]?.contextWindow;
-	const entry = recordServedWindow(codebuddyModelId(model), {
-		contextWindow: served.contextWindow,
-		maxOutputTokens: served.maxOutputTokens,
-	});
-	if (!entry) return;
-	if (entry.contextWindow === before && entry.maxOutputTokens === readServedWindows()[codebuddyModelId(model)]?.maxOutputTokens) return;
+	const reported = codebuddyModelId(model);
+	void observeWindow(
+		reported,
+		{ contextWindow: served.contextWindow, maxOutputTokens: served.maxOutputTokens },
+		piCtxDeps,
+	).catch(() => {});
 	debug(
-		`${label}: learned served window for ${codebuddyModelId(model)}: ` +
-		`contextWindow ${before ?? "?"} → ${entry.contextWindow}, maxTokens → ${entry.maxOutputTokens ?? "?"}`,
+		`${label}: reported served window for ${reported}: ` +
+		`contextWindow ${served.contextWindow ?? "?"}, maxTokens ${served.maxOutputTokens ?? "?"}`,
 	);
 }
 
@@ -1832,7 +1835,7 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 				rawModelsFromSdk(supported as any),
 				providerSettings.modelOverrides ? undefined : providerSettings,
 				providerSettings.modelOverrides,
-				readServedWindows(),
+				await readPiCtxWindows(piCtxDeps),
 			);
 			// Persist the successful discovery globally so a later session
 			// resume (module reload) can recover the real model list even if
@@ -1905,10 +1908,10 @@ export default async function (pi: ExtensionAPI) {
 	if (cached && cached.length) {
 		// The cache stores built models, window guesses included. Re-apply anything
 		// the CLI has since taught us before this list becomes the registered one.
-		MODELS = applyServedWindows(cached, readServedWindows());
+		MODELS = applyWindows(cached, await readPiCtxWindows(piCtxDeps));
 		debug(`default: recovered ${MODELS.length} cached models from prior discovery`);
 	} else {
-		MODELS = buildModels(FALLBACK_MODELS, providerSettings, providerSettings.modelOverrides, readServedWindows());
+		MODELS = buildModels(FALLBACK_MODELS, providerSettings, providerSettings.modelOverrides, await readPiCtxWindows(piCtxDeps));
 	}
 
 	// Discover real models BEFORE registering the provider, so the first
