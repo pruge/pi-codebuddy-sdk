@@ -13,7 +13,13 @@ export type PiModel = {
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 };
 
-const DEFAULT_CONTEXT = 131_072;
+// The SDK's model list carries no window, so every model needs one before the
+// CLI reports the served truth. Start wide and let `served-context.ts` narrow
+// it: a too-large window delays compaction by a bounded amount and is corrected
+// on the first turn, while a too-small one compacts irreversibly and early.
+// Names are not evidence — `hy3` serves 192k and `hy4-preview` serves 1M, so
+// no per-family guess.
+const DEFAULT_CONTEXT = 1_048_576;
 const DEFAULT_MAX_TOKENS = 8192;
 
 function detectThinking(id: string): boolean {
@@ -24,10 +30,7 @@ function detectImages(id: string): boolean {
 	return /claude|gemini|gpt/i.test(id);
 }
 
-function estimateContext(id: string): number {
-	const lower = id.toLowerCase();
-	if (lower.includes("gemini")) return 1_048_576;
-	if (lower.includes("claude") || lower.includes("gpt")) return 200_000;
+function estimateContext(): number {
 	return DEFAULT_CONTEXT;
 }
 
@@ -45,7 +48,7 @@ export function rawModelsFromSdk(supported: Array<ModelInfo & { id?: string; nam
 		name: m.name || m.id!,
 		reasoning: detectThinking(m.id!),
 		input: detectImages(m.id!) ? ["text", "image"] as const : ["text"] as const,
-		contextWindow: estimateContext(m.id!),
+		contextWindow: estimateContext(),
 		maxTokens: estimateMaxTokens(m.id!),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	}));

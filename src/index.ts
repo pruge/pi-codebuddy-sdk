@@ -1908,7 +1908,7 @@ export default async function (pi: ExtensionAPI) {
 		MODELS = applyServedWindows(cached, readServedWindows());
 		debug(`default: recovered ${MODELS.length} cached models from prior discovery`);
 	} else {
-		MODELS = buildModels(FALLBACK_MODELS, providerSettings, providerSettings.modelOverrides);
+		MODELS = buildModels(FALLBACK_MODELS, providerSettings, providerSettings.modelOverrides, readServedWindows());
 	}
 
 	// Discover real models BEFORE registering the provider, so the first

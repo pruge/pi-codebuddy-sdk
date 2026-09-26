@@ -97,10 +97,12 @@ describe("buildModels precedence", () => {
 		assert.equal(out[0].contextWindow, 8192);
 	});
 
-	it("without served, the estimate is what registers", () => {
+	it("without served, every model registers the wide default", () => {
 		const out = buildModels(rawModelsFromSdk([{ id: "hy3", name: "Hy3" }, { id: "gpt-5.6-sol", name: "GPT" }]));
-		assert.equal(out.find((x) => x.id === "hy3").contextWindow, 131072, "the guess that caused the bug");
-		assert.equal(out.find((x) => x.id === "gpt-5.6-sol").contextWindow, 200_000, "name-based guess still applies");
+		// No name branch: `hy3` serves 192k and `hy4-preview` serves 1M, so a
+		// family guess is not evidence. Wide until the CLI narrows it.
+		assert.equal(out.find((x) => x.id === "hy3").contextWindow, 1_048_576);
+		assert.equal(out.find((x) => x.id === "gpt-5.6-sol").contextWindow, 1_048_576);
 	});
 
 	it("a learned window survives a cache round-trip through the models cache path", () => {
