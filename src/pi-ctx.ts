@@ -17,8 +17,9 @@
 // and each distinct problem is logged at most once.
 
 import { execFile } from "child_process";
-import { existsSync } from "fs";
-import { delimiter, join } from "path";
+import { existsSync, readFileSync } from "fs";
+import { homedir } from "os";
+import { delimiter, isAbsolute, join } from "path";
 import { PROVIDER_ID } from "./convert.js";
 
 /** One learned window, as `pi-ctx status --json` reports it. */
@@ -30,6 +31,9 @@ export type PiCtxRun = { ok: boolean; stdout: string; reason?: string };
 export type PiCtxDeps = {
 	env?: Record<string, string | undefined>;
 	exists?: (path: string) => boolean;
+	/** Test seams for the self-announced path under ~/.pi/agent/pi-ctx/cli-path. */
+	agentDir?: string;
+	readFile?: (path: string, encoding: "utf8") => string;
 	/** Injected so the rules stay unit-testable without spawning anything. */
 	run?: (bin: string, args: string[]) => Promise<PiCtxRun>;
 	timeoutMs?: number;
@@ -56,9 +60,9 @@ function warnOnce(deps: PiCtxDeps, problem: string, message: string): void {
 }
 
 /**
- * Where the pi-ctx CLI is: `PI_CTX_BIN` first, then `pi-ctx` on PATH. Undefined
- * means "not installed", which is a supported state — observation is skipped and
- * the SDK keeps working on its own fallback window.
+ * Where the pi-ctx CLI is: explicit override, PATH, then pi-ctx's own marker.
+ * Undefined means "not installed", which is a supported state — observation is
+ * skipped and the SDK keeps working on its own fallback window.
  */
 export function resolvePiCtxBin(deps: PiCtxDeps = {}): string | undefined {
 	const env = deps.env ?? process.env;
@@ -70,6 +74,15 @@ export function resolvePiCtxBin(deps: PiCtxDeps = {}): string | undefined {
 		if (!dir) continue;
 		const candidate = join(dir, name);
 		if (exists(candidate)) return candidate;
+	}
+	const agentDir = deps.agentDir ?? join(homedir(), ".pi", "agent");
+	const marker = join(agentDir, "pi-ctx", "cli-path");
+	if (!exists(marker)) return undefined;
+	try {
+		const candidate = (deps.readFile ?? ((path) => readFileSync(path, "utf8")))(marker, "utf8").trim();
+		if (candidate && isAbsolute(candidate) && exists(candidate)) return candidate;
+	} catch {
+		// A missing, unreadable, or stale marker is the same as no installed CLI.
 	}
 	return undefined;
 }

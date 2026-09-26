@@ -41,6 +41,31 @@ describe("resolvePiCtxBin", () => {
 		assert.equal(resolvePiCtxBin({ env: { PATH: "/a:/b" }, exists: (path) => path === "/b/pi-ctx" }), "/b/pi-ctx");
 	});
 
+	it("reads the self-announced absolute CLI path after PATH", () => {
+		const marker = "/agent/pi-ctx/cli-path";
+		const bin = "/workspace/pi-ctx/src/cli.ts";
+		const deps = {
+			env: { PATH: "" },
+			agentDir: "/agent",
+			exists: (path) => path === marker || path === bin,
+			readFile: (path) => path === marker ? `${bin}\n` : "",
+		};
+		assert.equal(resolvePiCtxBin(deps), bin);
+	});
+
+	it("prefers PATH over the marker and ignores a broken marker", () => {
+		const marker = "/agent/pi-ctx/cli-path";
+		const pathBin = "/bin/pi-ctx";
+		const deps = {
+			env: { PATH: "/bin" },
+			agentDir: "/agent",
+			exists: (path) => path === marker || path === pathBin,
+			readFile: () => "/missing/pi-ctx",
+		};
+		assert.equal(resolvePiCtxBin(deps), pathBin);
+		assert.equal(resolvePiCtxBin({ ...deps, env: { PATH: "" }, exists: (path) => path === marker, readFile: () => "relative/path" }), undefined);
+	});
+
 	it("returns undefined when pi-ctx is not installed", () => {
 		assert.equal(resolvePiCtxBin({ env: { PATH: "/a:/b" }, exists: () => false }), undefined);
 	});
@@ -99,6 +124,24 @@ describe("observeWindow", () => {
 });
 
 describe("readPiCtxWindows", () => {
+	it("uses the marker when PI_CTX_BIN and PATH have no executable", async () => {
+		const marker = "/agent/pi-ctx/cli-path";
+		const bin = "/workspace/pi-ctx/src/cli.ts";
+		const calls = [];
+		const deps = {
+			env: { PATH: "" },
+			agentDir: "/agent",
+			exists: (path) => path === marker || path === bin,
+			readFile: () => `${bin}\n`,
+			run: async (actualBin, args) => {
+				calls.push({ actualBin, args });
+				return { ok: true, stdout: JSON.stringify({ windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }) };
+			},
+		};
+		assert.deepEqual(await readPiCtxWindows(deps), { "codebuddy/hy3": { contextWindow: 192_000 } });
+		assert.deepEqual(calls, [{ actualBin: bin, args: ["status", "--json"] }]);
+	});
+
 	it("parses the windows out of status --json", async () => {
 		const { deps } = harness({
 			ok: true,

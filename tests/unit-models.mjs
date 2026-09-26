@@ -83,16 +83,27 @@ describe("resolveModel", () => {
 // side: how learned windows interact with config overrides.
 describe("learned windows (applyWindows / buildModels precedence)", () => {
 	const m = (id) => ({ id, name: id, reasoning: false, input: ["text"], contextWindow: 1_048_576, maxTokens: 8_192, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
-	const windows = { hy3: { contextWindow: 192_000, maxOutputTokens: 64_000 } };
+	const windows = {
+		"codebuddy/hy3": { contextWindow: 192_000, maxOutputTokens: 64_000 },
+		"cline/hy3": { contextWindow: 128_000, maxOutputTokens: 32_000 },
+	};
 
-	it("replaces the fallback window and maxTokens with what pi-ctx learned", () => {
+	it("replaces the fallback window and maxTokens with the provider-qualified CodeBuddy observation", () => {
 		const out = applyWindows([m("hy3")], windows);
 		assert.equal(out[0].contextWindow, 192_000);
 		assert.equal(out[0].maxTokens, 64_000);
 	});
 
+	it("ignores a bare model key and does not borrow another provider's same id", () => {
+		const out = applyWindows([m("hy3")], {
+			hy3: { contextWindow: 99_000 },
+			"cline/hy3": { contextWindow: 128_000 },
+		});
+		assert.equal(out[0].contextWindow, 1_048_576);
+	});
+
 	it("leaves maxTokens alone when only the window was learned", () => {
-		const out = applyWindows([m("hy3")], { hy3: { contextWindow: 192_000 } });
+		const out = applyWindows([m("hy3")], { "codebuddy/hy3": { contextWindow: 192_000 } });
 		assert.equal(out[0].maxTokens, 8_192);
 	});
 

@@ -1,6 +1,7 @@
 // Dynamic model list from CodeBuddy SDK supportedModels().
 
 import type { ModelInfo } from "@tencent-ai/agent-sdk";
+import { PROVIDER_ID } from "./convert.js";
 import type { PiCtxWindows } from "./pi-ctx.js";
 
 export type PiModel = {
@@ -74,7 +75,7 @@ export function applyWindows<T extends { id: string; contextWindow: number; maxT
 	windows: PiCtxWindows,
 ): T[] {
 	return models.map((m) => {
-		const learned = windows[m.id];
+		const learned = windows[`${PROVIDER_ID}/${m.id}`];
 		if (!learned || typeof learned.contextWindow !== "number") return m;
 		return {
 			...m,
