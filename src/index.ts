@@ -760,6 +760,13 @@ export const __test = {
 
 // --- Provider helpers: tool name mapping ---
 
+// The CLI's MCP naming rule is `mcp__{server}__{tool}` (see the SDK's
+// mcp-server-utils.d.ts). Models sometimes emit a single trailing underscore
+// instead — `mcp__custom_tools_bash` — which no lookup can reverse. Match the
+// server segment without caring how many underscores separate it, then drop
+// any leftover separator from the tool name.
+const MCP_SERVER_SEGMENT = `mcp__${MCP_SERVER_NAME}_`;
+
 function mapToolName(name: string, customToolNameToPi?: Map<string, string>): string {
 	const normalized = name.toLowerCase();
 	const builtin = SDK_TO_PI_TOOL_NAME[normalized];
@@ -768,8 +775,45 @@ function mapToolName(name: string, customToolNameToPi?: Map<string, string>): st
 		const mapped = customToolNameToPi.get(name) ?? customToolNameToPi.get(normalized);
 		if (mapped) return mapped;
 	}
-	if (normalized.startsWith(MCP_TOOL_PREFIX)) return name.slice(MCP_TOOL_PREFIX.length);
+	if (normalized.startsWith(MCP_SERVER_SEGMENT)) {
+		// Slice the normalized name, then restore the declared casing, so a
+		// mis-cased mis-separated call still lands on the real pi tool name.
+		const stripped = normalized.slice(MCP_SERVER_SEGMENT.length).replace(/^_+/, "");
+		for (const piName of new Set(customToolNameToPi?.values() ?? [])) {
+			if (piName.toLowerCase() === stripped) return piName;
+		}
+		return SDK_TO_PI_TOOL_NAME[stripped] ?? stripped;
+	}
 	return name;
+}
+
+/** The pi tool names this turn may legitimately produce. */
+function knownPiToolNames(customToolNameToPi?: Map<string, string>): Set<string> {
+	const known = new Set(Object.values(SDK_TO_PI_TOOL_NAME));
+	for (const piName of customToolNameToPi?.values() ?? []) known.add(piName);
+	return known;
+}
+
+/**
+ * A name the model called that maps to no pi tool.
+ *
+ * Forwarding it anyway produces pi's "does not exist in the current tool set"
+ * and kills the turn, so the model never learns it was wrong. Detected here
+ * instead so the turn can carry the correction and the model can retry inside
+ * the same CLI turn — the same outcome the SDK's `registerTool` wrapper gets
+ * for free on the handler path (`createToolError` → `isError: true` result),
+ * except that a mis-prefixed name never reaches the handler at all.
+ */
+function unknownToolCorrection(rawName: string, customToolNameToPi?: Map<string, string>): string | null {
+	if (!customToolNameToPi || customToolNameToPi.size === 0) return null;
+	if (knownPiToolNames(customToolNameToPi).has(mapToolName(rawName, customToolNameToPi))) return null;
+	const available = [...new Set(customToolNameToPi.values())].sort();
+	return [
+		`Unknown tool: ${rawName}`,
+		"",
+		`Available tools: ${available.join(", ")}`,
+		`Call them as ${MCP_TOOL_PREFIX}{name}, e.g. ${MCP_TOOL_PREFIX}${available[0] ?? "bash"}.`,
+	].join("\n");
 }
 
 // Renames for CodeBuddy SDK param names that differ from pi's native names.
@@ -1033,6 +1077,16 @@ function processStreamEvent(
 			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
 			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
 		} else if (event.content_block?.type === "tool_use") {
+			const unknown = unknownToolCorrection(event.content_block.name, customToolNameToPi);
+			if (unknown) {
+				// Tell the model and keep the turn open so it can retry. Emitting
+				// a toolCall here would end the turn with a name pi cannot run.
+				debug(`tool_use: unknown tool name "${event.content_block.name}" — sending correction, not a toolCall`);
+				c.turnBlocks.push({ type: "text", text: unknown, index: event.index });
+				c.currentPiStream!.push({ type: "text_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
+				c.currentPiStream!.push({ type: "text_end", contentIndex: c.turnBlocks.length - 1, content: unknown, partial: c.turnOutput });
+				return;
+			}
 			c.turnSawToolCall = true;
 			c.turnToolCallIds.push(event.content_block.id);
 			c.turnBlocks.push({
