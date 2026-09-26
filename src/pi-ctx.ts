@@ -60,11 +60,17 @@ function state(): PiCtxState {
 	return (holder[STATE_KEY] ??= { warned: new Set<string>() });
 }
 
-function warnOnce(deps: PiCtxDeps, problem: string, message: string): void {
+function warnOnce(deps: PiCtxDeps, problem: string, message: string, stderrToo = false): void {
 	const warned = state().warned;
 	if (warned.has(problem)) return;
 	warned.add(problem);
 	deps.onProblem?.(message);
+	if (stderrToo) {
+		// A contract violation must be visible even when onProblem routes into a
+		// debug file (default). Normal paths stay silent; only these format
+		// warnings reach stderr, once each, via the same dedupe.
+		try { process.stderr.write(`pi-codebuddy-sdk: ${message}\n`); } catch { /* stderr may be gone */ }
+	}
 }
 
 /**
@@ -168,17 +174,17 @@ export function readPiCtxWindows(deps: PiCtxDeps = {}): Promise<PiCtxWindows> {
 			if (typeof parsed?.format !== "number") {
 				// M1's bug was a parse that succeeded and was silently dropped. A
 				// missing version must be loud, not treated as "the old format".
-				warnOnce(deps, "status-format-missing", "pi-ctx status --json has no format version; ignoring its windows (update pi-ctx)");
+				warnOnce(deps, "status-format-missing", "pi-ctx status --json has no format version; ignoring its windows (update pi-ctx)", true);
 				return {};
 			}
 			if (parsed.format > SUPPORTED_FORMAT) {
 				// A newer format may use unknown key rules — reading it anyway would
 				// repeat exactly the silently-dropped-keys failure.
-				warnOnce(deps, `status-format-${parsed.format}`, `pi-ctx status --json format ${parsed.format} is newer than supported ${SUPPORTED_FORMAT}; ignoring its windows (update pi-codebuddy-sdk)`);
+				warnOnce(deps, `status-format-${parsed.format}`, `pi-ctx status --json format ${parsed.format} is newer than supported ${SUPPORTED_FORMAT}; ignoring its windows (update pi-codebuddy-sdk)`, true);
 				return {};
 			}
 			if (parsed.format < SUPPORTED_FORMAT) {
-				warnOnce(deps, `status-format-${parsed.format}`, `pi-ctx status --json format ${parsed.format} is older than supported ${SUPPORTED_FORMAT}; ignoring its windows (update pi-ctx)`);
+				warnOnce(deps, `status-format-${parsed.format}`, `pi-ctx status --json format ${parsed.format} is older than supported ${SUPPORTED_FORMAT}; ignoring its windows (update pi-ctx)`, true);
 				return {};
 			}
 			const windows = parsed?.windows;

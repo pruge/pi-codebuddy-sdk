@@ -32,6 +32,14 @@ beforeEach(() => {
 	globalThis[STATE_KEY] = undefined;
 });
 
+/** Capture what actually reaches stderr, not just the injected onProblem. */
+function captureStderr() {
+	const original = process.stderr.write;
+	let out = "";
+	process.stderr.write = (chunk) => { out += String(chunk); return true; };
+	return { out: () => out, restore: () => { process.stderr.write = original; } };
+}
+
 describe("resolvePiCtxBin", () => {
 	it("prefers PI_CTX_BIN", () => {
 		assert.equal(resolvePiCtxBin({ env: { PI_CTX_BIN: "/x/pi-ctx" }, exists: () => true }), "/x/pi-ctx");
@@ -185,23 +193,37 @@ describe("readPiCtxWindows", () => {
 
 	it("ignores a response with no format version instead of guessing", async () => {
 		const { deps, problems } = harness({ ok: true, stdout: JSON.stringify({ windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }) });
-		assert.deepEqual(await readPiCtxWindows(deps), {});
+		const stderr = captureStderr();
+		try {
+			assert.deepEqual(await readPiCtxWindows(deps), {});
+		} finally { stderr.restore(); }
 		assert.equal(problems.length, 1);
 		assert.match(problems[0], /no format version/);
+		// The default onProblem routes into a debug file; stderr is the only
+		// channel an operator sees. A captured array alone proves nothing.
+		assert.match(stderr.out(), /no format version/);
 	});
 
 	it("ignores a newer format and says the key rules may differ", async () => {
 		const { deps, problems } = harness({ ok: true, stdout: JSON.stringify({ format: 2, windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }) });
-		assert.deepEqual(await readPiCtxWindows(deps), {});
+		const stderr = captureStderr();
+		try {
+			assert.deepEqual(await readPiCtxWindows(deps), {});
+		} finally { stderr.restore(); }
 		assert.equal(problems.length, 1);
 		assert.match(problems[0], /newer/);
+		assert.match(stderr.out(), /newer than supported/);
 	});
 
 	it("ignores an older format", async () => {
 		const { deps, problems } = harness({ ok: true, stdout: JSON.stringify({ format: 0, windows: {} }) });
-		assert.deepEqual(await readPiCtxWindows(deps), {});
+		const stderr = captureStderr();
+		try {
+			assert.deepEqual(await readPiCtxWindows(deps), {});
+		} finally { stderr.restore(); }
 		assert.equal(problems.length, 1);
 		assert.match(problems[0], /older/);
+		assert.match(stderr.out(), /older than supported/);
 	});
 
 	it("warns and skips keys that are not provider/model", async () => {
@@ -220,5 +242,14 @@ describe("readPiCtxWindows", () => {
 		assert.deepEqual(await readPiCtxWindows(deps), { "codebuddy/hy3": { contextWindow: 192_000 } });
 		assert.equal(problems.length, 3);
 		assert.match(problems[0], /bare-model/);
+	});
+
+	it("writes nothing to stderr on a healthy format-1 response", async () => {
+		const { deps } = harness({ ok: true, stdout: JSON.stringify({ format: 1, windows: { "codebuddy/hy3": { contextWindow: 192_000 } } }) });
+		const stderr = captureStderr();
+		try {
+			assert.deepEqual(await readPiCtxWindows(deps), { "codebuddy/hy3": { contextWindow: 192_000 } });
+		} finally { stderr.restore(); }
+		assert.equal(stderr.out(), "", "the normal path must stay silent");
 	});
 });
